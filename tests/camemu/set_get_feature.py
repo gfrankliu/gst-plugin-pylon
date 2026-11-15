@@ -4,8 +4,9 @@
 Writes and reads back camera features through the signals, including a
 selected feature, and checks each failure result: missing feature, selector or
 selector value, read-only feature, invalid and out of range values, a feature
-without a value, and no open camera. If the camera has a lookup table register
-(LUTValueAll), it also checks that a register write must fill it.
+without a value, and no open camera. Also checks that an element that opened
+its camera but was never started releases it. If the camera has a lookup table
+register (LUTValueAll), it also checks that a register write must fill it.
 """
 
 import argparse
@@ -56,6 +57,18 @@ def main():
         get_feature(idle, "Gain") is None,
         "get-feature without a camera returned a value",
     )
+
+    # An element dropped after opening its camera through a child, without
+    # ever starting, must release the camera for the next element.
+    for attempt in range(3):
+        element = Gst.ElementFactory.make("pylonsrc", None)
+        element.set_property("device-serial-number", args.serial)
+        cam = element.get_child_by_name("cam")
+        check(
+            cam is not None,
+            "camera did not open for element {}".format(attempt),
+        )
+        del cam, element
 
     pipeline = Gst.parse_launch(
         "pylonsrc name=src device-serial-number={serial} "

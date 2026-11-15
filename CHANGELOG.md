@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- Close a camera opened by accessing the `cam` or `stream` child when the
+  element is finalized without having been started, so another element can
+  open the device
 - NVMM: YUY2/UYVY caps with full-range colorimetry get the extended-range
   surface formats (`NVBUF_COLOR_FORMAT_YUYV_ER`/`_UYVY_ER`), so NVMM
   conversions downstream keep the samples instead of clamping them to 16..235
