@@ -104,11 +104,19 @@ static gboolean gst_pylon_src_execute_command(GstPylonSrc* self,
                                               const gchar* command,
                                               const gchar* selector,
                                               const gchar* selector_value);
+static gint gst_pylon_src_set_feature(GstPylonSrc* self, const gchar* name,
+                                      const gchar* value, const gchar* selector,
+                                      const gchar* selector_value);
+static gchar* gst_pylon_src_get_feature(GstPylonSrc* self, const gchar* name,
+                                        const gchar* selector,
+                                        const gchar* selector_value);
 
 static void gst_pylon_src_child_proxy_init(GstChildProxyInterface* iface);
 
 enum {
   SIGNAL_EXECUTE_COMMAND,
+  SIGNAL_SET_FEATURE,
+  SIGNAL_GET_FEATURE,
   LAST_SIGNAL,
 };
 
@@ -436,6 +444,53 @@ static void gst_pylon_src_class_init(GstPylonSrcClass* klass) {
       static_cast<GSignalFlags>(G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION),
       G_CALLBACK(gst_pylon_src_execute_command), NULL, NULL, NULL,
       G_TYPE_BOOLEAN, 3, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
+
+  /**
+   * GstPylonSrc::set-feature:
+   * @pylonsrc: the #GstPylonSrc
+   * @name: name of the GenICam feature, e.g. "ExposureTime"
+   * @value: the value in its string form, as in a .pfs file: e.g. "8000",
+   *   "true", "Continuous", or "0x" and hex digits for a register
+   * @selector: (nullable): name of the selector the feature depends on, e.g.
+   *   "LUTSelector", or %NULL if the feature is not selected
+   * @selector_value: (nullable): value to select, e.g. "Luminance"
+   *
+   * Writes any value feature of the open camera, including features that have
+   * no "cam::" property: registers, and features that only become available
+   * once another feature is set. A register value must fill the register. The
+   * selector, if given, is restored to its previous value afterwards.
+   *
+   * Returns: 0 if written; 1 if the camera has no such feature, selector or
+   *   selector value; 2 if the feature cannot be written in the camera's
+   *   current state; 3 if the value is invalid, out of range or rejected by
+   *   the camera; 4 on any other failure (e.g. no open camera).
+   */
+  gst_pylon_src_signals[SIGNAL_SET_FEATURE] = g_signal_new_class_handler(
+      "set-feature", G_TYPE_FROM_CLASS(klass),
+      static_cast<GSignalFlags>(G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION),
+      G_CALLBACK(gst_pylon_src_set_feature), NULL, NULL, NULL, G_TYPE_INT, 4,
+      G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
+
+  /**
+   * GstPylonSrc::get-feature:
+   * @pylonsrc: the #GstPylonSrc
+   * @name: name of the GenICam feature
+   * @selector: (nullable): name of the selector the feature depends on, or
+   *   %NULL if the feature is not selected
+   * @selector_value: (nullable): value to select
+   *
+   * Reads any value feature of the open camera in the string form
+   * set-feature takes. The value is read from the camera, not from pylon's
+   * cache, so it confirms what the camera holds.
+   *
+   * Returns: (transfer full) (nullable): the value, or %NULL if the feature
+   *   does not exist, cannot be read now or the camera is not open.
+   */
+  gst_pylon_src_signals[SIGNAL_GET_FEATURE] = g_signal_new_class_handler(
+      "get-feature", G_TYPE_FROM_CLASS(klass),
+      static_cast<GSignalFlags>(G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION),
+      G_CALLBACK(gst_pylon_src_get_feature), NULL, NULL, NULL, G_TYPE_STRING, 3,
+      G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING);
 
   base_src_class->get_caps = GST_DEBUG_FUNCPTR(gst_pylon_src_get_caps);
   base_src_class->fixate = GST_DEBUG_FUNCPTR(gst_pylon_src_fixate);
@@ -1026,6 +1081,71 @@ static gboolean gst_pylon_src_execute_command(GstPylonSrc* self,
   }
 
   return TRUE;
+}
+
+static gint gst_pylon_src_set_feature(GstPylonSrc* self, const gchar* name,
+                                      const gchar* value, const gchar* selector,
+                                      const gchar* selector_value) {
+  GError* error = NULL;
+
+  g_return_val_if_fail(GST_IS_PYLON_SRC(self), GST_PYLON_FEATURE_FAILED);
+
+  if (!name || !*name || !value) {
+    GST_ERROR_OBJECT(self, "set-feature requires a feature name and a value");
+    return GST_PYLON_FEATURE_FAILED;
+  }
+
+  GST_OBJECT_LOCK(self);
+  if (!self->pylon) {
+    GST_OBJECT_UNLOCK(self);
+    GST_ERROR_OBJECT(self, "Unable to set feature \"%s\": no camera is open",
+                     name);
+    return GST_PYLON_FEATURE_FAILED;
+  }
+  GstPylonFeatureResult result = gst_pylon_set_feature(
+      self->pylon, name, value, selector, selector_value, &error);
+  GST_OBJECT_UNLOCK(self);
+
+  if (result != GST_PYLON_FEATURE_OK) {
+    GST_WARNING_OBJECT(self, "%s", error ? error->message : "unknown error");
+    g_clear_error(&error);
+    return result;
+  }
+
+  GST_INFO_OBJECT(
+      self, "Set feature \"%s\"%s%s%s", name, selector && *selector ? " (" : "",
+      selector && *selector ? selector : "", selector && *selector ? ")" : "");
+  return GST_PYLON_FEATURE_OK;
+}
+
+static gchar* gst_pylon_src_get_feature(GstPylonSrc* self, const gchar* name,
+                                        const gchar* selector,
+                                        const gchar* selector_value) {
+  GError* error = NULL;
+
+  g_return_val_if_fail(GST_IS_PYLON_SRC(self), NULL);
+
+  if (!name || !*name) {
+    GST_ERROR_OBJECT(self, "get-feature requires a feature name");
+    return NULL;
+  }
+
+  GST_OBJECT_LOCK(self);
+  if (!self->pylon) {
+    GST_OBJECT_UNLOCK(self);
+    GST_ERROR_OBJECT(self, "Unable to read feature \"%s\": no camera is open",
+                     name);
+    return NULL;
+  }
+  gchar* value = gst_pylon_get_feature(self->pylon, name, selector,
+                                       selector_value, &error);
+  GST_OBJECT_UNLOCK(self);
+
+  if (!value) {
+    GST_WARNING_OBJECT(self, "%s", error ? error->message : "unknown error");
+    g_clear_error(&error);
+  }
+  return value;
 }
 
 /* notify subclasses of a query */

@@ -79,6 +79,30 @@ gboolean gst_pylon_set_pfs_config(GstPylon* self, const gchar* pfs_location,
 gboolean gst_pylon_execute_command(GstPylon* self, const gchar* command,
                                    const gchar* selector,
                                    const gchar* selector_value, GError** err);
+
+/* Result of gst_pylon_set_feature(), and of the set-feature action signal. */
+typedef enum {
+  GST_PYLON_FEATURE_OK = 0,
+  /* The camera has no such feature, selector or selector value. */
+  GST_PYLON_FEATURE_NOT_FOUND = 1,
+  /* The feature exists but cannot be written in the camera's current state,
+   * e.g. it depends on another feature or is locked while grabbing. */
+  GST_PYLON_FEATURE_NOT_WRITABLE = 2,
+  /* The value does not parse, is out of range or the camera rejected it. */
+  GST_PYLON_FEATURE_INVALID_VALUE = 3,
+  /* Anything else: no open camera, invalid arguments, a feature without a
+   * value (command or category), a communication error. */
+  GST_PYLON_FEATURE_FAILED = 4,
+} GstPylonFeatureResult;
+
+GstPylonFeatureResult gst_pylon_set_feature(GstPylon* self, const gchar* name,
+                                            const gchar* value,
+                                            const gchar* selector,
+                                            const gchar* selector_value,
+                                            GError** err);
+gchar* gst_pylon_get_feature(GstPylon* self, const gchar* name,
+                             const gchar* selector, const gchar* selector_value,
+                             GError** err);
 gchar* gst_pylon_camera_get_string_properties();
 gchar* gst_pylon_stream_grabber_get_string_properties();
 

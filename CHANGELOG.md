@@ -35,6 +35,11 @@ All notable changes to this project will be documented in this file.
 - `execute-command` action signal on `pylonsrc` to execute GenICam command
   features (e.g. `CounterReset`) with an optional selector; camemu test
   `execute_command.py` covers it with software triggering
+- `set-feature` and `get-feature` action signals on `pylonsrc` to write and
+  read any value feature by name, including features without a `cam::`
+  property (registers such as `LUTValueAll`, features that depend on another
+  feature); `get-feature` reads from the camera rather than pylon's cache;
+  camemu test `set_get_feature.py`
 - Camemu test `restart_resource_leak.py` uses 4096×4096 RGB frames and checks
   pipe FD + RSS growth across EOS and abrupt-stop pipeline restart cycles
 - CI installs `python3-gi` so camemu appsink / restart regression tests run

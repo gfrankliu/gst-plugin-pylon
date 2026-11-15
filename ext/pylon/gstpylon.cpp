@@ -52,7 +52,10 @@
 #include "gstpylonsysmembufferfactory.h"
 
 #include <chrono>
+#include <cstdint>
+#include <cstring>
 #include <map>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -1199,6 +1202,71 @@ gchar* gst_pylon_stream_grabber_get_string_properties() {
       gst_pylon_append_stream_grabber_properties);
 }
 
+/* Selects a feature instance through its selector for as long as it lives and
+ * restores the selector's previous value afterwards, so accessing the feature
+ * leaves no side effect on other selected features. Use it with the node map
+ * lock held. */
+class GstPylonSelectorScope {
+ public:
+  explicit GstPylonSelectorScope(GenApi::INodeMap& nodemap)
+      : nodemap_(nodemap) {}
+
+  ~GstPylonSelectorScope() {
+    if (selector_.empty()) {
+      return;
+    }
+    try {
+      param_.FromString(previous_value_.c_str());
+    } catch (const Pylon::GenericException& e) {
+      GST_WARNING("Unable to restore selector \"%s\" to \"%s\": %s",
+                  selector_.c_str(), previous_value_.c_str(),
+                  e.GetDescription());
+    }
+  }
+
+  /* Selects selector_value, or does nothing if selector is NULL or empty.
+   * Returns FALSE with err set if the camera has no such selector, and throws
+   * if the value cannot be selected. */
+  gboolean select(const gchar* selector, const gchar* selector_value,
+                  GError** err) {
+    if (!selector || !*selector) {
+      return TRUE;
+    }
+    GenApi::INode* node = nodemap_.GetNode(selector);
+    if (!node || !GenApi::IsImplemented(node)) {
+      g_set_error(err, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_SETTINGS,
+                  "Selector \"%s\" is not available on this camera", selector);
+      return FALSE;
+    }
+    /* Selectors may be enumerations or integers, so they are set through
+     * their string representation. */
+    param_.Attach(node);
+    std::string previous_value = param_.ToString().c_str();
+    param_.FromString(selector_value);
+    selector_ = selector;
+    previous_value_ = previous_value;
+    return TRUE;
+  }
+
+ private:
+  GenApi::INodeMap& nodemap_;
+  Pylon::CParameter param_;
+  std::string selector_;
+  std::string previous_value_;
+};
+
+/* A selector needs a value to select. */
+static gboolean gst_pylon_check_selector_args(const gchar* selector,
+                                              const gchar* selector_value,
+                                              GError** err) {
+  if (selector && *selector && !(selector_value && *selector_value)) {
+    g_set_error(err, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_SETTINGS,
+                "Selector \"%s\" given without a selector value", selector);
+    return FALSE;
+  }
+  return TRUE;
+}
+
 gboolean gst_pylon_execute_command(GstPylon* self, const gchar* command,
                                    const gchar* selector,
                                    const gchar* selector_value, GError** err) {
@@ -1206,10 +1274,7 @@ gboolean gst_pylon_execute_command(GstPylon* self, const gchar* command,
   g_return_val_if_fail(command, FALSE);
   g_return_val_if_fail(err && *err == NULL, FALSE);
 
-  const gboolean has_selector = selector && *selector;
-  if (has_selector && !(selector_value && *selector_value)) {
-    g_set_error(err, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_SETTINGS,
-                "Selector \"%s\" given without a selector value", selector);
+  if (!gst_pylon_check_selector_args(selector, selector_value, err)) {
     return FALSE;
   }
 
@@ -1232,59 +1297,26 @@ gboolean gst_pylon_execute_command(GstPylon* self, const gchar* command,
       return FALSE;
     }
 
-    /* Selectors may be enumerations or integers, so they are set through their
-     * string representation. The previous value is restored afterwards so the
-     * command does not leave a side effect on other selected features. */
-    Pylon::CParameter selector_param;
-    std::string previous_selector_value;
-    if (has_selector) {
-      GenApi::INode* selector_node = nodemap.GetNode(selector);
-      if (!selector_node || !GenApi::IsImplemented(selector_node)) {
-        g_set_error(err, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_SETTINGS,
-                    "Selector \"%s\" is not available on this camera",
-                    selector);
+    GstPylonSelectorScope selection(nodemap);
+    if (!selection.select(selector, selector_value, err)) {
+      return FALSE;
+    }
+
+    Pylon::CCommandParameter command_param(command_node);
+    command_param.Execute();
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(COMMAND_DONE_TIMEOUT_MS);
+    while (!command_param.IsDone()) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        g_set_error(err, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_FAILED,
+                    "Command \"%s\" did not complete within %d ms", command,
+                    COMMAND_DONE_TIMEOUT_MS);
         return FALSE;
       }
-      selector_param.Attach(selector_node);
-      previous_selector_value = selector_param.ToString().c_str();
-      selector_param.FromString(selector_value);
+      std::this_thread::sleep_for(
+          std::chrono::milliseconds(COMMAND_DONE_POLL_INTERVAL_MS));
     }
-
-    auto restore_selector = [&]() {
-      if (!has_selector) {
-        return;
-      }
-      try {
-        selector_param.FromString(previous_selector_value.c_str());
-      } catch (const Pylon::GenericException& e) {
-        GST_WARNING("Unable to restore selector \"%s\" to \"%s\": %s", selector,
-                    previous_selector_value.c_str(), e.GetDescription());
-      }
-    };
-
-    try {
-      Pylon::CCommandParameter command_param(command_node);
-      command_param.Execute();
-
-      const auto deadline = std::chrono::steady_clock::now() +
-                            std::chrono::milliseconds(COMMAND_DONE_TIMEOUT_MS);
-      while (!command_param.IsDone()) {
-        if (std::chrono::steady_clock::now() >= deadline) {
-          restore_selector();
-          g_set_error(err, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_FAILED,
-                      "Command \"%s\" did not complete within %d ms", command,
-                      COMMAND_DONE_TIMEOUT_MS);
-          return FALSE;
-        }
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(COMMAND_DONE_POLL_INTERVAL_MS));
-      }
-    } catch (const Pylon::GenericException&) {
-      restore_selector();
-      throw;
-    }
-
-    restore_selector();
   } catch (const Pylon::GenericException& e) {
     g_set_error(err, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_FAILED,
                 "Failed to execute command \"%s\": %s", command,
@@ -1293,6 +1325,180 @@ gboolean gst_pylon_execute_command(GstPylon* self, const gchar* command,
   }
 
   return TRUE;
+}
+
+/* Finds a value feature (not a command or category) for set-feature and
+ * get-feature and selects its instance. A missing feature, selector or
+ * selector value is GST_PYLON_FEATURE_NOT_FOUND. */
+static GstPylonFeatureResult gst_pylon_find_value_feature(
+    GenApi::INodeMap& nodemap, GstPylonSelectorScope& selection,
+    const gchar* name, const gchar* selector, const gchar* selector_value,
+    GenApi::INode** node, GError** err) {
+  GenApi::INode* feature = nodemap.GetNode(name);
+  if (!feature) {
+    g_set_error(err, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_SETTINGS,
+                "Feature \"%s\" is not available on this camera", name);
+    return GST_PYLON_FEATURE_NOT_FOUND;
+  }
+  try {
+    if (!selection.select(selector, selector_value, err)) {
+      return GST_PYLON_FEATURE_NOT_FOUND;
+    }
+  } catch (const Pylon::GenericException& e) {
+    g_set_error(err, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_SETTINGS,
+                "Selector \"%s\" cannot select \"%s\": %s", selector,
+                selector_value, e.GetDescription());
+    return GST_PYLON_FEATURE_NOT_FOUND;
+  }
+  if (!GenApi::IsImplemented(feature)) {
+    g_set_error(err, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_SETTINGS,
+                "Feature \"%s\" is not available on this camera", name);
+    return GST_PYLON_FEATURE_NOT_FOUND;
+  }
+  switch (feature->GetPrincipalInterfaceType()) {
+    case GenApi::intfICommand:
+    case GenApi::intfICategory:
+    case GenApi::intfIPort:
+    case GenApi::intfIBase:
+      g_set_error(err, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_SETTINGS,
+                  "Feature \"%s\" has no value", name);
+      return GST_PYLON_FEATURE_FAILED;
+    default:
+      break;
+  }
+  *node = feature;
+  return GST_PYLON_FEATURE_OK;
+}
+
+/* The value for messages: register values run to thousands of hex digits. */
+static std::string gst_pylon_value_for_log(const gchar* value) {
+  const size_t max_length = 64;
+  std::string s(value);
+  if (s.size() <= max_length) {
+    return s;
+  }
+  return s.substr(0, max_length) + "... (" + std::to_string(s.size()) +
+         " characters)";
+}
+
+GstPylonFeatureResult gst_pylon_set_feature(GstPylon* self, const gchar* name,
+                                            const gchar* value,
+                                            const gchar* selector,
+                                            const gchar* selector_value,
+                                            GError** err) {
+  g_return_val_if_fail(self, GST_PYLON_FEATURE_FAILED);
+  g_return_val_if_fail(name, GST_PYLON_FEATURE_FAILED);
+  g_return_val_if_fail(value, GST_PYLON_FEATURE_FAILED);
+  g_return_val_if_fail(err && *err == NULL, GST_PYLON_FEATURE_FAILED);
+
+  if (!gst_pylon_check_selector_args(selector, selector_value, err)) {
+    return GST_PYLON_FEATURE_FAILED;
+  }
+
+  try {
+    GenApi::INodeMap& nodemap = self->camera->GetNodeMap();
+    GenApi::AutoLock lock(nodemap.GetLock());
+    GstPylonSelectorScope selection(nodemap);
+
+    GenApi::INode* node = NULL;
+    GstPylonFeatureResult result = gst_pylon_find_value_feature(
+        nodemap, selection, name, selector, selector_value, &node, err);
+    if (result != GST_PYLON_FEATURE_OK) {
+      return result;
+    }
+
+    if (!GenApi::IsWritable(node)) {
+      g_set_error(err, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_SETTINGS,
+                  "Feature \"%s\" is not writable now", name);
+      return GST_PYLON_FEATURE_NOT_WRITABLE;
+    }
+
+    /* A shorter register value is written to the start of the register
+     * only, leaving the rest as it was, so require the whole register. */
+    if (node->GetPrincipalInterfaceType() == GenApi::intfIRegister) {
+      GenApi::CRegisterPtr reg(node);
+      const gchar* digits = g_str_has_prefix(value, "0x") ? value + 2 : value;
+      const int64_t length = reg->GetLength();
+      if (static_cast<int64_t>(strlen(digits)) != 2 * length) {
+        g_set_error(err, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_SETTINGS,
+                    "Register \"%s\" needs %" G_GINT64_FORMAT
+                    " bytes (0x and %" G_GINT64_FORMAT " hex digits)",
+                    name, static_cast<gint64>(length),
+                    static_cast<gint64>(2 * length));
+        return GST_PYLON_FEATURE_INVALID_VALUE;
+      }
+    }
+
+    try {
+      GenApi::CValuePtr(node)->FromString(value);
+    } catch (const GenICam::AccessException& e) {
+      g_set_error(err, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_SETTINGS,
+                  "Feature \"%s\" is not writable now: %s", name,
+                  e.GetDescription());
+      return GST_PYLON_FEATURE_NOT_WRITABLE;
+    } catch (const GenICam::InvalidArgumentException& e) {
+      g_set_error(err, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_SETTINGS,
+                  "Invalid value %s for feature \"%s\": %s",
+                  gst_pylon_value_for_log(value).c_str(), name,
+                  e.GetDescription());
+      return GST_PYLON_FEATURE_INVALID_VALUE;
+    } catch (const GenICam::OutOfRangeException& e) {
+      g_set_error(err, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_SETTINGS,
+                  "Value %s out of range for feature \"%s\": %s",
+                  gst_pylon_value_for_log(value).c_str(), name,
+                  e.GetDescription());
+      return GST_PYLON_FEATURE_INVALID_VALUE;
+    } catch (const GenICam::RuntimeException& e) {
+      /* e.g. a lookup table entry beyond the sensor's bit depth */
+      g_set_error(err, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_SETTINGS,
+                  "Camera rejected value %s for feature \"%s\": %s",
+                  gst_pylon_value_for_log(value).c_str(), name,
+                  e.GetDescription());
+      return GST_PYLON_FEATURE_INVALID_VALUE;
+    }
+  } catch (const Pylon::GenericException& e) {
+    g_set_error(err, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_FAILED,
+                "Failed to set feature \"%s\": %s", name, e.GetDescription());
+    return GST_PYLON_FEATURE_FAILED;
+  }
+
+  return GST_PYLON_FEATURE_OK;
+}
+
+gchar* gst_pylon_get_feature(GstPylon* self, const gchar* name,
+                             const gchar* selector, const gchar* selector_value,
+                             GError** err) {
+  g_return_val_if_fail(self, NULL);
+  g_return_val_if_fail(name, NULL);
+  g_return_val_if_fail(err && *err == NULL, NULL);
+
+  if (!gst_pylon_check_selector_args(selector, selector_value, err)) {
+    return NULL;
+  }
+
+  try {
+    GenApi::INodeMap& nodemap = self->camera->GetNodeMap();
+    GenApi::AutoLock lock(nodemap.GetLock());
+    GstPylonSelectorScope selection(nodemap);
+
+    GenApi::INode* node = NULL;
+    if (gst_pylon_find_value_feature(nodemap, selection, name, selector,
+                                     selector_value, &node,
+                                     err) != GST_PYLON_FEATURE_OK) {
+      return NULL;
+    }
+    if (!GenApi::IsReadable(node)) {
+      g_set_error(err, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_SETTINGS,
+                  "Feature \"%s\" is not readable now", name);
+      return NULL;
+    }
+    /* Read from the camera rather than pylon's cache of the last write. */
+    return g_strdup(GenApi::CValuePtr(node)->ToString(false, true).c_str());
+  } catch (const Pylon::GenericException& e) {
+    g_set_error(err, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_FAILED,
+                "Failed to read feature \"%s\": %s", name, e.GetDescription());
+    return NULL;
+  }
 }
 
 GObject* gst_pylon_get_camera(GstPylon* self) {
