@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- Close a camera that was opened by accessing the `cam` or `stream` child when
+  the element is finalized without having been started, so the device is free
+  for the next element and pylon no longer holds it at process exit (abort
+  "terminate called without an active exception")
 - NVMM: YUY2/UYVY caps with full-range colorimetry get the extended-range
   surface formats (`NVBUF_COLOR_FORMAT_YUYV_ER`/`_UYVY_ER`), so NVMM
   conversions downstream keep the samples instead of clamping them to 16..235

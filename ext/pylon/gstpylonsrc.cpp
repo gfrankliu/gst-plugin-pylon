@@ -667,6 +667,15 @@ static void gst_pylon_src_finalize(GObject* object) {
     self->stream = NULL;
   }
 
+  /* A camera opened by accessing the cam or stream child, without starting
+   * the element, is not closed by stop(): close it here so the device is
+   * free for the next element and pylon does not hold it at process exit. */
+  if (self->pylon) {
+    gst_pylon_free(self->pylon);
+    self->pylon = NULL;
+    Pylon::PylonTerminate();
+  }
+
   G_OBJECT_CLASS(gst_pylon_src_parent_class)->finalize(object);
 }
 
