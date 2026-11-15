@@ -341,6 +341,45 @@ ok = pylonsrc.emit("execute-command", "CounterReset", "CounterSelector", "Counte
 
 Some cameras only allow a software counter reset if `cam::CounterResetSource-Counter1=Software` is set.
 
+### Setting and reading any feature
+
+Some features get no `cam::` property: registers such as the lookup table (`LUTValueAll`), and features that only become available once another feature is set, such as the dual conversion gains (`BslDualConversionGainHigh`/`Low`) of ace 2 cameras with that firmware, which need `BslDualConversionGainEnable`. The `set-feature` and `get-feature` action signals write and read any value feature of the open camera by name, in the string form a `.pfs` file uses:
+
+```
+gint set-feature (GstElement *pylonsrc, const gchar *name, const gchar *value,
+                  const gchar *selector, const gchar *selector_value);
+gchar *get-feature (GstElement *pylonsrc, const gchar *name,
+                    const gchar *selector, const gchar *selector_value);
+```
+
+* `value`: e.g. `24`, `true`, `Continuous`, or for a register `0x` followed by hex digits that fill the whole register (a shorter value would only overwrite the start of it, so it is rejected).
+* `selector`, `selector_value`: as for `execute-command`; the selector is restored afterwards.
+
+`set-feature` returns:
+
+| Result | Meaning |
+| --- | --- |
+| 0 | written |
+| 1 | the camera has no such feature, selector or selector value |
+| 2 | the feature cannot be written in the camera's current state (e.g. it depends on another feature, or is locked while grabbing) |
+| 3 | the value is invalid, out of range or rejected by the camera |
+| 4 | any other failure, e.g. no open camera or a feature without a value |
+
+`get-feature` reads the value from the camera rather than pylon's cache of the last write, so it confirms what the camera holds. It returns `NULL` if the feature does not exist, cannot be read now, or the camera is not open. As with `execute-command`, the camera must be open, and the reason for a failure is in the GStreamer log.
+
+**Example**
+
+Turn on dual conversion gain HDR, then set its gains:
+
+```
+# Python
+for name, value in (("BslDualConversionGainEnable", "true"),
+                    ("BslDualConversionGainHigh", "24"),
+                    ("BslDualConversionGainLow", "22")):
+    assert pylonsrc.emit("set-feature", name, value, None, None) == 0
+print(pylonsrc.emit("get-feature", "BslDualConversionGainHigh", None, None))  # 24.014
+```
+
 ### Chunks and Capture metadata
 
 Chunk support is available. The selected chunks will be appended to each gstreamer buffer as meta data.
